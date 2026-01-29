@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+env/
+.python-version
+
+# Caches
+.cache/
+.pytest_cache/
+
+# Data/artifacts
+data/
+*.jsonl
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.tar.gz
+
+# Logs
+*.log
+
