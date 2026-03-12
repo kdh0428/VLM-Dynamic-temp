@@ -21,6 +21,15 @@ data/
 *.jpeg
 *.gif
 *.tar.gz
+*.pt
+*.csv
+
+# Result metadata (config/diag/results JSONs at repo root)
+results_*.json
+
+# Analysis & results directories (contain large binary artifacts)
+results/
+analysis_subspace/
 
 # Logs
 *.log

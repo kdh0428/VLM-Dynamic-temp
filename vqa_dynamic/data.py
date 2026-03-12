@@ -228,6 +228,23 @@ def load_vqav2_dataset(
             }
 
         return ds.map(_map_docvqa)
+    if dataset_id == "merve/vqav2-small":
+        ds = load_dataset(dataset_id, split=split)
+
+        def _map_vqav2(ex):
+            ans = str(ex.get("multiple_choice_answer", "")).strip()
+            return {
+                "image": ex.get("image"),
+                "question": ex.get("question", ""),
+                "answers": [ans],
+                "question_id": None,
+                "task_type": "yesno" if ans.lower() in ("yes", "no") else "vqa",
+            }
+
+        ds = ds.map(_map_vqav2)
+        ds = ds.filter(lambda ex: ex["task_type"] == "yesno")
+        LOGGER.info("VQAv2-small yes/no filtered: %d samples", len(ds))
+        return ds
     if dataset_id == "Lin-Chen/MMStar":
         ds = load_dataset(dataset_id, split="val")
 
