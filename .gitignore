@@ -29,7 +29,7 @@ results_*.json
 
 # Analysis & results directories (contain large binary artifacts)
 results/
-analysis_subspace/
+analysis_*/
 
 # Logs
 *.log

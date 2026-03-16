@@ -982,6 +982,27 @@ def _decode_with_attn_gate(
             gen_cfg.subspace_tau = float(getattr(args, "subspace_tau", 0.5))
             gen_cfg.subspace_tau_max = float(getattr(args, "subspace_tau_max", 0.7))
             gen_cfg.subspace_lambda_max = float(getattr(args, "subspace_lambda", 0.5))
+            gen_cfg.risk_gate_mode = str(getattr(args, "risk_gate_mode", "ratio_only"))
+            gen_cfg.subspace_tau_abs = float(getattr(args, "subspace_tau_abs", 30.0))
+            # Contrastive-axis intervention
+            gen_cfg.contrastive_enable = bool(getattr(args, "contrastive_enable", False))
+            gen_cfg.contrastive_layer = int(getattr(args, "contrastive_layer", 19))
+            gen_cfg.contrastive_tau_s = float(getattr(args, "contrastive_tau_s", 0.0))
+            gen_cfg.contrastive_lambda = float(getattr(args, "contrastive_lambda", 0.5))
+            _etg._CONTRASTIVE_TENSORS = {
+                "m": getattr(args, "_contrastive_m", None),
+                "v_hat": getattr(args, "_contrastive_v_hat", None),
+            }
+            # Probe intervention
+            gen_cfg.probe_enable = bool(getattr(args, "probe_enable", False))
+            gen_cfg.probe_layer = int(getattr(args, "probe_layer", 19))
+            gen_cfg.probe_tau_s = float(getattr(args, "probe_tau_s", 0.0))
+            gen_cfg.probe_tau_min = float(getattr(args, "probe_tau_min", -5.0))
+            gen_cfg.probe_lambda = float(getattr(args, "probe_lambda", 1.0))
+            _etg._PROBE_TENSORS = {
+                "w": getattr(args, "_probe_w", None),
+                "b": getattr(args, "_probe_b", None),
+            }
             if "instructblip" in model_id_l and (task_mode or "") == "yesno":
                 # InstructBLIP on yes/no tends to collapse under sampling in this path.
                 # Keep deterministic decoding unless user explicitly enables sampling.
@@ -1351,6 +1372,26 @@ def _decode_with_attn_gate(
             "subspace_n_bases": getattr(outputs, "subspace_n_bases", None),
             "subspace_residual_before_mean": getattr(outputs, "subspace_residual_before_mean", None),
             "subspace_residual_after_mean": getattr(outputs, "subspace_residual_after_mean", None),
+            "prefill_geom_before": getattr(outputs, "prefill_geom_before", None),
+            "prefill_geom_after": getattr(outputs, "prefill_geom_after", None),
+            "prefill_delta_risk": getattr(outputs, "prefill_delta_risk", None),
+            "prefill_delta_orth": getattr(outputs, "prefill_delta_orth", None),
+            "subspace_prefill_orth_abs": getattr(outputs, "subspace_prefill_orth_abs", None),
+            "risk_gate_mode": getattr(outputs, "risk_gate_mode", None),
+            "subspace_tau_abs": getattr(outputs, "subspace_tau_abs", None),
+            "contrastive_s_before": getattr(outputs, "contrastive_s_before", None),
+            "contrastive_s_after": getattr(outputs, "contrastive_s_after", None),
+            "contrastive_delta_s": getattr(outputs, "contrastive_delta_s", None),
+            "contrastive_applied": getattr(outputs, "contrastive_applied", None),
+            "contrastive_risk": getattr(outputs, "contrastive_risk", None),
+            "contrastive_orth_abs": getattr(outputs, "contrastive_orth_abs", None),
+            "probe_s_before": getattr(outputs, "probe_s_before", None),
+            "probe_s_after": getattr(outputs, "probe_s_after", None),
+            "probe_delta_s": getattr(outputs, "probe_delta_s", None),
+            "probe_applied": getattr(outputs, "probe_applied", None),
+            "probe_alpha": getattr(outputs, "probe_alpha", None),
+            "probe_risk": getattr(outputs, "probe_risk", None),
+            "probe_orth_abs": getattr(outputs, "probe_orth_abs", None),
             "timing_forward_s": getattr(outputs, "timing", {}).get("forward_s") if hasattr(outputs, "timing") else None,
             "timing_entropy_s": getattr(outputs, "timing", {}).get("entropy_s") if hasattr(outputs, "timing") else None,
             "timing_sampling_s": getattr(outputs, "timing", {}).get("sampling_s") if hasattr(outputs, "timing") else None,
@@ -2284,6 +2325,184 @@ def run_hf_attn_gate(
             len(risk_map),
             ("None" if args._subspace_risk_threshold is None else f"{args._subspace_risk_threshold:.6f}"),
         )
+    # ── Contrastive-axis tensors ──
+    args._contrastive_m = None
+    args._contrastive_v_hat = None
+    if bool(getattr(args, "contrastive_enable", False)):
+        c_dir = str(getattr(args, "contrastive_dir", "") or "").strip()
+        if not c_dir:
+            raise ValueError("--contrastive-enable requires --contrastive-dir")
+        m_path = Path(c_dir) / "contrastive_m.pt"
+        v_path = Path(c_dir) / "contrastive_v_hat.pt"
+        if not m_path.exists():
+            raise FileNotFoundError(f"contrastive midpoint missing: {m_path}")
+        if not v_path.exists():
+            raise FileNotFoundError(f"contrastive v_hat missing: {v_path}")
+        args._contrastive_m = torch.load(m_path, map_location=device).float()
+        args._contrastive_v_hat = torch.load(v_path, map_location=device).float()
+        _c_layer = int(getattr(args, "contrastive_layer", 19))
+        _has_basis = bool(getattr(args, "subspace_shrink_enable", False))
+        # Check if a basis layer actually matches contrastive layer
+        _gate_effective = False
+        if _has_basis:
+            _basis_layers = [b["layer"] for b in getattr(args, "_subspace_basis_list", [])
+                             if isinstance(b, dict)]
+            if _c_layer in _basis_layers:
+                _gate_effective = True
+            else:
+                LOGGER.warning(
+                    "Contrastive layer=%d has no matching subspace basis "
+                    "(available: %s) — risk gate will be DISABLED at hook level",
+                    _c_layer, _basis_layers,
+                )
+        # Enforce same-source calibration when risk gate is active
+        if _gate_effective:
+            _c_meta_path = Path(c_dir) / "meta.json"
+            _b_meta_path = Path(str(getattr(args, "subspace_basis_dir", ""))) / "meta.json"
+            if not _c_meta_path.exists():
+                raise FileNotFoundError(
+                    f"Contrastive dir missing meta.json: {_c_meta_path}. "
+                    f"Cannot verify calibration source."
+                )
+            if not _b_meta_path.exists():
+                raise FileNotFoundError(
+                    f"Subspace basis dir missing meta.json: {_b_meta_path}. "
+                    f"Cannot verify calibration source."
+                )
+            with open(_c_meta_path) as _f:
+                _c_source = json.load(_f).get("hidden_jsonl")
+            with open(_b_meta_path) as _f:
+                _b_source = json.load(_f).get("hidden_jsonl")
+            if not _c_source:
+                raise ValueError(
+                    f"Contrastive meta.json missing 'hidden_jsonl' key: "
+                    f"{_c_meta_path}"
+                )
+            if not _b_source:
+                raise ValueError(
+                    f"Subspace basis meta.json missing 'hidden_jsonl' key: "
+                    f"{_b_meta_path}"
+                )
+            if _c_source != _b_source:
+                raise ValueError(
+                    f"Source mismatch: contrastive axis from '{_c_source}' but "
+                    f"risk gate basis from '{_b_source}'. Both must come from "
+                    f"the same calibration split. Fix --contrastive-dir or "
+                    f"--subspace-basis-dir."
+                )
+        else:
+            _c_source = None
+            _b_source = None
+        LOGGER.info(
+            "Contrastive-axis enabled | layer=%d tau_s=%.4f lambda=%.4f d=%d "
+            "risk_gate=%s",
+            _c_layer,
+            float(getattr(args, "contrastive_tau_s", 0.0)),
+            float(getattr(args, "contrastive_lambda", 0.5)),
+            int(args._contrastive_v_hat.shape[0]),
+            f"ON (basis L{_c_layer})" if _gate_effective else "OFF (ungated)",
+        )
+        LOGGER.info(
+            "  contrastive source: %s | basis source: %s",
+            _c_source or "(unknown)",
+            _b_source or "(none)",
+        )
+        if _gate_effective:
+            LOGGER.info(
+                "Contrastive supersedes subspace hook — "
+                "subspace basis used for risk gate only"
+            )
+
+    # ── Probe tensors ──
+    args._probe_w = None
+    args._probe_b = None
+    if bool(getattr(args, "probe_enable", False)):
+        p_dir = str(getattr(args, "probe_dir", "") or "").strip()
+        if not p_dir:
+            raise ValueError("--probe-enable requires --probe-dir")
+        w_path = Path(p_dir) / "weight.pt"
+        b_path = Path(p_dir) / "bias.pt"
+        if not w_path.exists():
+            raise FileNotFoundError(f"Probe weight missing: {w_path}")
+        if not b_path.exists():
+            raise FileNotFoundError(f"Probe bias missing: {b_path}")
+        args._probe_w = torch.load(w_path, map_location=device).float()
+        args._probe_b = torch.load(b_path, map_location=device).float()
+        _p_layer = int(getattr(args, "probe_layer", 19))
+        # Verify probe artifact layer matches --probe-layer
+        _p_meta_path = Path(p_dir) / "meta.json"
+        if _p_meta_path.exists():
+            with open(_p_meta_path) as _f:
+                _p_meta = json.load(_f)
+            _p_artifact_layer = _p_meta.get("layer")
+            if _p_artifact_layer is not None and int(_p_artifact_layer) != _p_layer:
+                raise ValueError(
+                    f"Probe artifact was trained on layer {_p_artifact_layer} "
+                    f"but --probe-layer={_p_layer}. These must match."
+                )
+        else:
+            raise FileNotFoundError(
+                f"Probe dir missing meta.json: {_p_meta_path}. "
+                f"Cannot verify probe artifact layer."
+            )
+        # Validate tau_min < tau_s
+        _p_tau_s = float(getattr(args, "probe_tau_s", 0.0))
+        _p_tau_min = float(getattr(args, "probe_tau_min", -5.0))
+        if _p_tau_min >= _p_tau_s:
+            raise ValueError(
+                f"--probe-tau-min ({_p_tau_min}) must be strictly less than "
+                f"--probe-tau-s ({_p_tau_s}) for alpha scheduling to work."
+            )
+        _p_has_basis = bool(getattr(args, "subspace_shrink_enable", False))
+        # Same-source enforcement when risk gate active
+        _p_gate_effective = False
+        if _p_has_basis:
+            _p_basis_layers = [b["layer"] for b in getattr(args, "_subspace_basis_list", [])
+                               if isinstance(b, dict)]
+            if _p_layer in _p_basis_layers:
+                _p_gate_effective = True
+            else:
+                LOGGER.warning(
+                    "Probe layer=%d has no matching subspace basis "
+                    "(available: %s) — risk gate will be DISABLED",
+                    _p_layer, _p_basis_layers,
+                )
+        if _p_gate_effective:
+            # _p_meta already loaded above (layer check guarantees meta.json exists)
+            _b_meta_path = Path(str(getattr(args, "subspace_basis_dir", ""))) / "meta.json"
+            if not _b_meta_path.exists():
+                raise FileNotFoundError(
+                    f"Subspace basis dir missing meta.json: {_b_meta_path}. "
+                    f"Cannot verify calibration source."
+                )
+            _p_source = _p_meta.get("train_jsonl")
+            with open(_b_meta_path) as _f:
+                _b_source = json.load(_f).get("hidden_jsonl")
+            if not _p_source:
+                raise ValueError(
+                    f"Probe meta.json missing 'train_jsonl' key: {_p_meta_path}"
+                )
+            if not _b_source:
+                raise ValueError(
+                    f"Basis meta.json missing 'hidden_jsonl' key: {_b_meta_path}"
+                )
+            if _p_source != _b_source:
+                raise ValueError(
+                    f"Source mismatch: probe from '{_p_source}' but "
+                    f"risk gate basis from '{_b_source}'. Both must come "
+                    f"from the same calibration split."
+                )
+        LOGGER.info(
+            "Probe intervention enabled | layer=%d tau_s=%.4f tau_min=%.4f "
+            "lambda=%.4f d=%d risk_gate=%s",
+            _p_layer,
+            float(getattr(args, "probe_tau_s", 0.0)),
+            float(getattr(args, "probe_tau_min", -5.0)),
+            float(getattr(args, "probe_lambda", 1.0)),
+            int(args._probe_w.shape[0]),
+            f"ON (basis L{_p_layer})" if _p_gate_effective else "OFF (ungated)",
+        )
+
     args.attn_modules = find_cross_attn_modules(model)
     bias_target = str(getattr(args, "attn_keyword_bias_target", "all")).lower()
     if bias_target == "last" and args.attn_modules:
@@ -2668,6 +2887,26 @@ def run_hf_attn_gate(
                 "subspace_n_bases": step_stats.get("subspace_n_bases"),
                 "subspace_residual_before_mean": step_stats.get("subspace_residual_before_mean"),
                 "subspace_residual_after_mean": step_stats.get("subspace_residual_after_mean"),
+                "prefill_geom_before": step_stats.get("prefill_geom_before"),
+                "prefill_geom_after": step_stats.get("prefill_geom_after"),
+                "prefill_delta_risk": step_stats.get("prefill_delta_risk"),
+                "prefill_delta_orth": step_stats.get("prefill_delta_orth"),
+                "subspace_prefill_orth_abs": step_stats.get("subspace_prefill_orth_abs"),
+                "risk_gate_mode": step_stats.get("risk_gate_mode"),
+                "subspace_tau_abs": step_stats.get("subspace_tau_abs"),
+                "contrastive_s_before": step_stats.get("contrastive_s_before"),
+                "contrastive_s_after": step_stats.get("contrastive_s_after"),
+                "contrastive_delta_s": step_stats.get("contrastive_delta_s"),
+                "contrastive_applied": step_stats.get("contrastive_applied"),
+                "contrastive_risk": step_stats.get("contrastive_risk"),
+                "contrastive_orth_abs": step_stats.get("contrastive_orth_abs"),
+                "probe_s_before": step_stats.get("probe_s_before"),
+                "probe_s_after": step_stats.get("probe_s_after"),
+                "probe_delta_s": step_stats.get("probe_delta_s"),
+                "probe_applied": step_stats.get("probe_applied"),
+                "probe_alpha": step_stats.get("probe_alpha"),
+                "probe_risk": step_stats.get("probe_risk"),
+                "probe_orth_abs": step_stats.get("probe_orth_abs"),
             }
             f_out.write(json.dumps(record) + "\n")
             f_out.flush()

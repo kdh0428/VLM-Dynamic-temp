@@ -84,14 +84,19 @@ class SubspaceInterventionHook:
     """
 
     def __init__(self, mu: torch.Tensor, uk: torch.Tensor,
-                 tau: float, tau_max: float, lambda_max: float):
+                 tau: float, tau_max: float, lambda_max: float,
+                 risk_gate_mode: str = "ratio_only",
+                 tau_abs: float = 30.0):
         self.mu = mu                    # [d]
         self.uk = uk                    # [d, k]
         self.tau = float(tau)
         self.tau_max = float(tau_max)
         self.lambda_max = float(lambda_max)
+        self.risk_gate_mode = risk_gate_mode   # ratio_only | abs_only | ratio_and_abs
+        self.tau_abs = float(tau_abs)
         self.enabled = False
         self.prefill_risk = None
+        self.prefill_orth_abs = None
         self._reset()
 
     def _reset(self):
@@ -108,6 +113,9 @@ class SubspaceInterventionHook:
         """Call before each new sample generation."""
         self._reset()
         self.prefill_risk = None
+        self.prefill_orth_abs = None
+        self.prefill_geom_before = None   # {z_norm, proj_norm, orth_norm, risk}
+        self.prefill_geom_after = None    # same keys, post-intervention (None if not applied)
         self._step_count = 0
         self._decode_count = 0
 
@@ -133,32 +141,56 @@ class SubspaceInterventionHook:
         z_proj = (z @ uk) @ uk.T                            # [B, 1, d]
         z_orth = z - z_proj                                 # [B, 1, d]
 
-        # Risk: R(h) = ||z_orth|| / ||z||
+        # Risk: R(h) = ||z_orth|| / ||z||  and  e(h) = ||z_orth||
         z_norm = torch.linalg.norm(z, dim=-1).clamp(min=1e-8)
         orth_norm = torch.linalg.norm(z_orth, dim=-1)
         risk = float((orth_norm / z_norm).mean().item())
+        orth_abs = float(orth_norm.mean().item())
 
         self.last_risk = risk
-        self.last_orth_before = float(orth_norm.mean().item())
+        self.last_orth_before = orth_abs
 
-        # Record prefill risk separately (matches offline extraction scale)
+        # Record prefill geometry (before intervention)
+        proj_norm = float(torch.linalg.norm(z_proj, dim=-1).mean().item())
         if is_prefill:
             self.prefill_risk = risk
+            self.prefill_orth_abs = orth_abs
+            self.prefill_geom_before = {
+                "z_norm": float(z_norm.mean().item()),
+                "proj_norm": proj_norm,
+                "orth_norm": orth_abs,
+                "risk": risk,
+            }
         else:
             self._decode_count = getattr(self, "_decode_count", 0) + 1
 
         # Intervene on PREFILL only (yes/no decision is made here).
         # Decode steps are too late — the answer token is already determined.
+        # Note: prefill_geom_before/after are latched at prefill and preserved
+        # across subsequent decode steps (decode does not overwrite them).
         if not is_prefill:
             self.last_applied = False
             self.last_alpha = 0.0
             self.last_orth_after = self.last_orth_before
             return output
 
-        if risk <= self.tau:
+        # Gate: mode-dependent condition
+        mode = self.risk_gate_mode
+        if mode == "ratio_only":
+            gate_pass = risk > self.tau
+        elif mode == "abs_only":
+            gate_pass = orth_abs > self.tau_abs
+        else:  # ratio_and_abs
+            gate_pass = risk > self.tau and orth_abs > self.tau_abs
+
+        if not gate_pass:
             self.last_applied = False
             self.last_alpha = 0.0
             self.last_orth_after = self.last_orth_before
+            # No intervention: after mirrors before. Mark applied=False
+            # so downstream analysis can filter without cross-referencing.
+            self.prefill_geom_after = dict(self.prefill_geom_before)
+            self.prefill_geom_after["applied"] = False
             return output
 
         # Risk-proportional alpha
@@ -171,13 +203,303 @@ class SubspaceInterventionHook:
         # Realign: remove alpha fraction of orthogonal mismatch
         h_new = h_last - alpha * z_orth                     # [B, 1, d]
 
-        # Diagnostic: recompute orth after intervention
+        # Diagnostic: recompute full geometry after intervention
         z_new = h_new - mu.unsqueeze(0).unsqueeze(0)
-        z_new_orth = z_new - (z_new @ uk) @ uk.T
-        self.last_orth_after = float(torch.linalg.norm(z_new_orth, dim=-1).mean().item())
+        z_new_proj = (z_new @ uk) @ uk.T
+        z_new_orth = z_new - z_new_proj
+        z_new_norm = torch.linalg.norm(z_new, dim=-1).clamp(min=1e-8)
+        orth_new_norm = torch.linalg.norm(z_new_orth, dim=-1)
+        risk_after = float((orth_new_norm / z_new_norm).mean().item())
+        self.last_orth_after = float(orth_new_norm.mean().item())
+        self.prefill_geom_after = {
+            "z_norm": float(z_new_norm.mean().item()),
+            "proj_norm": float(torch.linalg.norm(z_new_proj, dim=-1).mean().item()),
+            "orth_norm": float(orth_new_norm.mean().item()),
+            "risk": risk_after,
+            "applied": True,
+        }
 
         h_modified = h_full.clone()
         h_modified[:, -1:, :] = h_new.to(h_full.dtype)
+
+        if isinstance(output, tuple):
+            return (h_modified,) + output[1:]
+        return h_modified
+
+
+class ContrastiveInterventionHook:
+    """Contrastive-axis-only intervention on prefill hidden state.
+
+    Optionally uses subspace risk R(h) as a gate, then steers along the
+    contrastive axis.  When mu/uk are not provided, the risk gate is
+    disabled and intervention fires for all samples with s < tau_s.
+
+    Gate (subspace risk, optional — requires mu, uk):
+        z = h - mu;  z_proj = Uk Uk^T z;  z_orth = z - z_proj
+        R(h) = ||z_orth|| / ||z||
+        Gate fires when R(h) > tau_risk.
+
+    Intervention (contrastive axis):
+        diff = h - m
+        s = <diff, v_hat>          (scalar projection: positive = correct side)
+        r = diff - s * v_hat       (residual, orthogonal to axis)
+        s' = s + lambda_max * (tau_s - s)   (push s toward tau_s)
+        h' = m + s' * v_hat + r    (only contrastive component changes)
+    """
+
+    def __init__(self, m: torch.Tensor, v_hat: torch.Tensor,
+                 tau_s: float, lambda_max: float,
+                 mu: Optional[torch.Tensor] = None,
+                 uk: Optional[torch.Tensor] = None,
+                 tau_risk: float = 0.0,
+                 risk_gate_mode: str = "ratio_only",
+                 tau_abs: float = 30.0):
+        self.m = m              # [d] midpoint
+        self.v_hat = v_hat      # [d] unit contrastive direction (wrong -> correct)
+        self.tau_s = float(tau_s)
+        self.lambda_max = float(lambda_max)
+        # Subspace risk gate (optional; if mu/uk not provided, gate always open)
+        self.mu = mu            # [d] correct mean for risk computation
+        self.uk = uk            # [d, k] correct subspace basis
+        self.tau_risk = float(tau_risk)
+        self.risk_gate_mode = risk_gate_mode
+        self.tau_abs = float(tau_abs)
+        self.has_risk_gate = mu is not None and uk is not None
+        self.enabled = False
+        self.prefill_s_before = None
+        self.prefill_s_after = None
+        self.prefill_applied = None
+        self.prefill_risk = None
+        self.prefill_orth_abs = None
+        self._step_count = 0
+        self._decode_count = 0
+
+    def reset_step(self):
+        pass
+
+    def reset_sample(self):
+        self.prefill_s_before = None
+        self.prefill_s_after = None
+        self.prefill_applied = None
+        self.prefill_risk = None
+        self.prefill_orth_abs = None
+        self._step_count = 0
+        self._decode_count = 0
+
+    def __call__(self, module, input, output):
+        if not self.enabled:
+            return output
+
+        if isinstance(output, tuple):
+            h_full = output[0]
+        else:
+            h_full = output
+
+        is_prefill = h_full.shape[1] > 1
+        self._step_count += 1
+
+        # Contrastive fields are latched at prefill and preserved across
+        # subsequent decode steps (decode does not overwrite them).
+        if not is_prefill:
+            self._decode_count += 1
+            return output
+
+        h_last = h_full[:, -1:, :].to(torch.float32)       # [B, 1, d]
+        m = self.m.to(device=h_last.device, dtype=torch.float32)
+        v = self.v_hat.to(device=h_last.device, dtype=torch.float32)
+
+        # ── Risk gate ──
+        risk = None
+        orth_abs = None
+        if self.has_risk_gate:
+            mu = self.mu.to(device=h_last.device, dtype=torch.float32)
+            uk = self.uk.to(device=h_last.device, dtype=torch.float32)
+            z = h_last.squeeze(1) - mu.unsqueeze(0)
+            z_proj = (z @ uk) @ uk.T
+            z_orth = z - z_proj
+            z_norm = torch.linalg.norm(z, dim=-1).clamp(min=1e-8)
+            orth_norm = torch.linalg.norm(z_orth, dim=-1)
+            risk = float((orth_norm / z_norm).mean().item())
+            orth_abs = float(orth_norm.mean().item())
+            self.prefill_risk = risk
+            self.prefill_orth_abs = orth_abs
+
+        # ── Contrastive decomposition ──
+        diff = h_last.squeeze(1) - m.unsqueeze(0)           # [B, d]
+        s = (diff * v.unsqueeze(0)).sum(dim=-1)              # [B]
+        r = diff - s.unsqueeze(-1) * v.unsqueeze(0)          # [B, d]
+
+        s_val = float(s.mean().item())
+        self.prefill_s_before = s_val
+
+        # Gate: mode-dependent risk condition AND s < tau_s
+        mode = self.risk_gate_mode
+        if not self.has_risk_gate:
+            risk_pass = True
+        elif mode == "ratio_only":
+            risk_pass = risk > self.tau_risk
+        elif mode == "abs_only":
+            risk_pass = orth_abs > self.tau_abs
+        else:  # ratio_and_abs
+            risk_pass = risk > self.tau_risk and orth_abs > self.tau_abs
+        s_pass = s_val < self.tau_s
+
+        if not (risk_pass and s_pass):
+            self.prefill_s_after = s_val
+            self.prefill_applied = False
+            return output
+
+        # Push s toward tau_s
+        s_new = s + self.lambda_max * (self.tau_s - s)       # [B]
+        self.prefill_s_after = float(s_new.mean().item())
+        self.prefill_applied = True
+
+        # Reconstruct: h' = m + s' * v_hat + r
+        h_new = m.unsqueeze(0) + s_new.unsqueeze(-1) * v.unsqueeze(0) + r
+
+        h_modified = h_full.clone()
+        h_modified[:, -1:, :] = h_new.unsqueeze(1).to(h_full.dtype)
+
+        if isinstance(output, tuple):
+            return (h_modified,) + output[1:]
+        return h_modified
+
+
+class ProbeInterventionHook:
+    """Logistic-probe-based intervention on prefill hidden state.
+
+    Computes probe margin s = w^T h + b.  Intervenes when s < tau_s
+    (and optionally risk > tau_risk), pushing h along w_hat.
+
+    Alpha scheduling (margin-proportional):
+        alpha = lambda_max * clip((tau_s - s) / (tau_s - tau_min), 0, 1)
+    Intervention:
+        h' = h + alpha * w_hat
+    """
+
+    def __init__(self, w: torch.Tensor, b: float,
+                 tau_s: float, tau_min: float, lambda_max: float,
+                 mu: Optional[torch.Tensor] = None,
+                 uk: Optional[torch.Tensor] = None,
+                 tau_risk: float = 0.0,
+                 risk_gate_mode: str = "ratio_only",
+                 tau_abs: float = 30.0):
+        self.w = w                          # [d] probe weight
+        self.b = float(b)                   # scalar bias
+        w_norm = torch.linalg.norm(w).clamp(min=1e-8)
+        self.w_hat = w / w_norm             # [d] unit direction
+        self.tau_s = float(tau_s)
+        self.tau_min = float(tau_min)
+        self.lambda_max = float(lambda_max)
+        # Subspace risk gate (optional)
+        self.mu = mu
+        self.uk = uk
+        self.tau_risk = float(tau_risk)
+        self.risk_gate_mode = risk_gate_mode
+        self.tau_abs = float(tau_abs)
+        self.has_risk_gate = mu is not None and uk is not None
+        self.enabled = False
+        self.prefill_s_before = None
+        self.prefill_s_after = None
+        self.prefill_applied = None
+        self.prefill_risk = None
+        self.prefill_orth_abs = None
+        self.prefill_alpha = None
+        self._step_count = 0
+        self._decode_count = 0
+
+    def reset_step(self):
+        pass
+
+    def reset_sample(self):
+        self.prefill_s_before = None
+        self.prefill_s_after = None
+        self.prefill_applied = None
+        self.prefill_risk = None
+        self.prefill_orth_abs = None
+        self.prefill_alpha = None
+        self._step_count = 0
+        self._decode_count = 0
+
+    def __call__(self, module, input, output):
+        if not self.enabled:
+            return output
+
+        if isinstance(output, tuple):
+            h_full = output[0]
+        else:
+            h_full = output
+
+        is_prefill = h_full.shape[1] > 1
+        self._step_count += 1
+
+        if not is_prefill:
+            self._decode_count += 1
+            return output
+
+        h_last = h_full[:, -1:, :].to(torch.float32)       # [B, 1, d]
+        w = self.w.to(device=h_last.device, dtype=torch.float32)
+        w_hat = self.w_hat.to(device=h_last.device, dtype=torch.float32)
+
+        # ── Probe margin ──
+        h_vec = h_last.squeeze(1)                            # [B, d]
+        s = (h_vec * w.unsqueeze(0)).sum(dim=-1) + self.b    # [B]
+        s_val = float(s.mean().item())
+        self.prefill_s_before = s_val
+
+        # ── Risk gate ──
+        risk = None
+        orth_abs = None
+        if self.has_risk_gate:
+            mu = self.mu.to(device=h_last.device, dtype=torch.float32)
+            uk = self.uk.to(device=h_last.device, dtype=torch.float32)
+            z = h_vec - mu.unsqueeze(0)
+            z_proj = (z @ uk) @ uk.T
+            z_orth = z - z_proj
+            z_norm = torch.linalg.norm(z, dim=-1).clamp(min=1e-8)
+            orth_norm = torch.linalg.norm(z_orth, dim=-1)
+            risk = float((orth_norm / z_norm).mean().item())
+            orth_abs = float(orth_norm.mean().item())
+            self.prefill_risk = risk
+            self.prefill_orth_abs = orth_abs
+
+        # Gate: mode-dependent risk condition AND s < tau_s
+        mode = self.risk_gate_mode
+        if not self.has_risk_gate:
+            risk_pass = True
+        elif mode == "ratio_only":
+            risk_pass = risk > self.tau_risk
+        elif mode == "abs_only":
+            risk_pass = orth_abs > self.tau_abs
+        else:  # ratio_and_abs
+            risk_pass = risk > self.tau_risk and orth_abs > self.tau_abs
+        s_pass = s_val < self.tau_s
+
+        if not (risk_pass and s_pass):
+            self.prefill_s_after = s_val
+            self.prefill_applied = False
+            self.prefill_alpha = 0.0
+            return output
+
+        # Alpha scheduling: stronger push for more negative s
+        denom = self.tau_s - self.tau_min
+        if abs(denom) < 1e-8:
+            frac = 1.0
+        else:
+            frac = float(((self.tau_s - s) / denom).clamp(0.0, 1.0).mean().item())
+        alpha = self.lambda_max * frac
+        self.prefill_alpha = alpha
+
+        # Intervention: h' = h + alpha * w_hat
+        h_new = h_vec + alpha * w_hat.unsqueeze(0)           # [B, d]
+
+        # Recompute margin after intervention
+        s_after = (h_new * w.unsqueeze(0)).sum(dim=-1) + self.b
+        self.prefill_s_after = float(s_after.mean().item())
+        self.prefill_applied = True
+
+        h_modified = h_full.clone()
+        h_modified[:, -1:, :] = h_new.unsqueeze(1).to(h_full.dtype)
 
         if isinstance(output, tuple):
             return (h_modified,) + output[1:]
@@ -718,6 +1040,27 @@ def entropy_temp_generate(
     subspace_tau = float(_get_param(model_kwargs, generation_config, "subspace_tau", 0.5))
     subspace_tau_max = float(_get_param(model_kwargs, generation_config, "subspace_tau_max", 0.7))
     subspace_lambda_max = float(_get_param(model_kwargs, generation_config, "subspace_lambda_max", 0.5))
+    risk_gate_mode = str(_get_param(model_kwargs, generation_config, "risk_gate_mode", "ratio_only"))
+    subspace_tau_abs = float(_get_param(model_kwargs, generation_config, "subspace_tau_abs", 30.0))
+
+    # ── Contrastive-axis intervention params ──
+    _ct = globals().get("_CONTRASTIVE_TENSORS", {})
+    contrastive_enable = bool(_get_param(model_kwargs, generation_config, "contrastive_enable", False))
+    contrastive_m = _ct.get("m") if _ct else None
+    contrastive_v_hat = _ct.get("v_hat") if _ct else None
+    contrastive_layer = int(_get_param(model_kwargs, generation_config, "contrastive_layer", 19))
+    contrastive_tau_s = float(_get_param(model_kwargs, generation_config, "contrastive_tau_s", 0.0))
+    contrastive_lambda = float(_get_param(model_kwargs, generation_config, "contrastive_lambda", 0.5))
+
+    # ── Probe intervention params ──
+    _pt = globals().get("_PROBE_TENSORS", {})
+    probe_enable = bool(_get_param(model_kwargs, generation_config, "probe_enable", False))
+    probe_w = _pt.get("w") if _pt else None
+    probe_b = _pt.get("b") if _pt else None
+    probe_layer = int(_get_param(model_kwargs, generation_config, "probe_layer", 19))
+    probe_tau_s = float(_get_param(model_kwargs, generation_config, "probe_tau_s", 0.0))
+    probe_tau_min = float(_get_param(model_kwargs, generation_config, "probe_tau_min", -5.0))
+    probe_lambda = float(_get_param(model_kwargs, generation_config, "probe_lambda", 1.0))
 
     du_lam = float(_get_param(model_kwargs, generation_config, "du_lam", 0.9))
     du_k = int(_get_param(model_kwargs, generation_config, "du_k", 2))
@@ -858,6 +1201,8 @@ def entropy_temp_generate(
                 tau=subspace_tau,
                 tau_max=subspace_tau_max,
                 lambda_max=subspace_lambda_max,
+                risk_gate_mode=risk_gate_mode,
+                tau_abs=subspace_tau_abs,
             )
             decoder_layers = _find_decoder_layers(model)
             if decoder_layers is not None:
@@ -866,6 +1211,127 @@ def entropy_temp_generate(
                 if 0 <= hook_layer_idx < len(decoder_layers):
                     _hook_handle = decoder_layers[hook_layer_idx].register_forward_hook(_intervention_hook)
                     _intervention_hook.enabled = True
+
+    # ── Contrastive-axis hook (supersedes subspace hook when active) ──
+    _contrastive_hook = None
+    _contrastive_handle = None
+    use_contrastive_hook = bool(
+        contrastive_enable and contrastive_m is not None and contrastive_v_hat is not None
+    )
+    if use_contrastive_hook:
+        # Contrastive supersedes subspace: remove subspace hook if registered
+        if _hook_handle is not None:
+            _hook_handle.remove()
+            _hook_handle = None
+        if _intervention_hook is not None:
+            _intervention_hook.enabled = False
+            _intervention_hook = None
+        # Find subspace basis for risk gate (optional, must match layer exactly)
+        _c_risk_mu = None
+        _c_risk_uk = None
+        if subspace_basis_list:
+            _avail_layers = []
+            for basis in subspace_basis_list:
+                if isinstance(basis, dict):
+                    _avail_layers.append(basis.get("layer"))
+                    if basis.get("layer") == contrastive_layer:
+                        _c_risk_mu = basis.get("mu")
+                        _c_risk_uk = basis.get("uk")
+                        break
+            if _c_risk_uk is None:
+                import warnings
+                warnings.warn(
+                    f"Contrastive hook: subspace basis provided but no layer "
+                    f"matches contrastive_layer={contrastive_layer}. "
+                    f"Available basis layers: {_avail_layers}. "
+                    f"Risk gate DISABLED — running ungated.",
+                    stacklevel=1,
+                )
+        _risk_gate_active = _c_risk_mu is not None and _c_risk_uk is not None
+        if not _risk_gate_active and not subspace_basis_list:
+            import warnings
+            warnings.warn(
+                "Contrastive hook: no subspace basis provided — "
+                "running UNGATED (all s < tau_s samples will be intervened). "
+                "Provide --subspace-shrink-enable with --subspace-basis-layer "
+                "matching --contrastive-layer to enable risk gating.",
+                stacklevel=1,
+            )
+        _contrastive_hook = ContrastiveInterventionHook(
+            m=contrastive_m,
+            v_hat=contrastive_v_hat,
+            tau_s=contrastive_tau_s,
+            lambda_max=contrastive_lambda,
+            mu=_c_risk_mu,
+            uk=_c_risk_uk,
+            tau_risk=subspace_tau,
+            risk_gate_mode=risk_gate_mode,
+            tau_abs=subspace_tau_abs,
+        )
+        decoder_layers = _find_decoder_layers(model)
+        if decoder_layers is not None:
+            hook_layer_idx = contrastive_layer - 1
+            if 0 <= hook_layer_idx < len(decoder_layers):
+                _contrastive_handle = decoder_layers[hook_layer_idx].register_forward_hook(_contrastive_hook)
+                _contrastive_hook.enabled = True
+
+    # ── Probe intervention hook (supersedes contrastive & subspace) ──
+    _probe_hook = None
+    _probe_handle = None
+    use_probe_hook = bool(
+        probe_enable and probe_w is not None and probe_b is not None
+    )
+    if use_probe_hook:
+        # Supersede contrastive hook if registered
+        if _contrastive_handle is not None:
+            _contrastive_handle.remove()
+            _contrastive_handle = None
+        if _contrastive_hook is not None:
+            _contrastive_hook.enabled = False
+            _contrastive_hook = None
+        # Supersede subspace hook if registered
+        if _hook_handle is not None:
+            _hook_handle.remove()
+            _hook_handle = None
+        if _intervention_hook is not None:
+            _intervention_hook.enabled = False
+            _intervention_hook = None
+        # Find subspace basis for risk gate (optional, must match layer exactly)
+        _p_risk_mu = None
+        _p_risk_uk = None
+        if subspace_basis_list:
+            for basis in subspace_basis_list:
+                if isinstance(basis, dict) and basis.get("layer") == probe_layer:
+                    _p_risk_mu = basis.get("mu")
+                    _p_risk_uk = basis.get("uk")
+                    break
+            if _p_risk_uk is None:
+                import warnings
+                _avail = [b.get("layer") for b in subspace_basis_list if isinstance(b, dict)]
+                warnings.warn(
+                    f"Probe hook: subspace basis provided but no layer "
+                    f"matches probe_layer={probe_layer}. "
+                    f"Available: {_avail}. Risk gate DISABLED.",
+                    stacklevel=1,
+                )
+        _probe_hook = ProbeInterventionHook(
+            w=probe_w,
+            b=float(probe_b),
+            tau_s=probe_tau_s,
+            tau_min=probe_tau_min,
+            lambda_max=probe_lambda,
+            mu=_p_risk_mu,
+            uk=_p_risk_uk,
+            tau_risk=subspace_tau,
+            risk_gate_mode=risk_gate_mode,
+            tau_abs=subspace_tau_abs,
+        )
+        decoder_layers = _find_decoder_layers(model)
+        if decoder_layers is not None:
+            hook_layer_idx = probe_layer - 1
+            if 0 <= hook_layer_idx < len(decoder_layers):
+                _probe_handle = decoder_layers[hook_layer_idx].register_forward_hook(_probe_hook)
+                _probe_hook.enabled = True
 
     # Legacy logit-replacement path (when not using hook)
     need_subspace_hidden = bool(
@@ -925,6 +1391,10 @@ def entropy_temp_generate(
     # Reset hook step counter for this sample
     if _intervention_hook is not None:
         _intervention_hook.reset_sample()
+    if _contrastive_hook is not None:
+        _contrastive_hook.reset_sample()
+    if _probe_hook is not None:
+        _probe_hook.reset_sample()
 
     while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -1633,6 +2103,13 @@ def entropy_temp_generate(
                   else (None if subspace_risk_score is None else float(subspace_risk_score)))
         )
         out.subspace_prefill_risk = _prefill_r
+        out.subspace_prefill_orth_abs = (
+            float(_intervention_hook.prefill_orth_abs)
+            if _intervention_hook is not None and _intervention_hook.prefill_orth_abs is not None
+            else None
+        )
+        out.risk_gate_mode = risk_gate_mode
+        out.subspace_tau_abs = subspace_tau_abs
         out.subspace_risk_threshold = (subspace_tau if use_subspace_hook
                                        else (None if subspace_risk_threshold is None else float(subspace_risk_threshold)))
         out.subspace_shrink_alpha = float(max(0.0, min(1.0, subspace_shrink_alpha)))
@@ -1647,6 +2124,55 @@ def entropy_temp_generate(
         out.subspace_residual_after_mean = (
             float(sum(subspace_res_after_vals) / len(subspace_res_after_vals)) if subspace_res_after_vals else None
         )
+        # Prefill-only geometric stats (before/after intervention)
+        _gb = _intervention_hook.prefill_geom_before if _intervention_hook is not None else None
+        _ga = _intervention_hook.prefill_geom_after if _intervention_hook is not None else None
+        out.prefill_geom_before = _gb
+        out.prefill_geom_after = _ga
+        if _gb is not None and _ga is not None:
+            out.prefill_delta_risk = _ga["risk"] - _gb["risk"]
+            out.prefill_delta_orth = _ga["orth_norm"] - _gb["orth_norm"]
+        else:
+            out.prefill_delta_risk = None
+            out.prefill_delta_orth = None
+        # ── Contrastive-axis intervention stats ──
+        if _contrastive_hook is not None:
+            out.contrastive_s_before = _contrastive_hook.prefill_s_before
+            out.contrastive_s_after = _contrastive_hook.prefill_s_after
+            out.contrastive_applied = _contrastive_hook.prefill_applied
+            out.contrastive_risk = _contrastive_hook.prefill_risk
+            out.contrastive_orth_abs = _contrastive_hook.prefill_orth_abs
+            if _contrastive_hook.prefill_s_before is not None and _contrastive_hook.prefill_s_after is not None:
+                out.contrastive_delta_s = _contrastive_hook.prefill_s_after - _contrastive_hook.prefill_s_before
+            else:
+                out.contrastive_delta_s = None
+        else:
+            out.contrastive_s_before = None
+            out.contrastive_s_after = None
+            out.contrastive_delta_s = None
+            out.contrastive_applied = None
+            out.contrastive_risk = None
+            out.contrastive_orth_abs = None
+        # ── Probe intervention stats ──
+        if _probe_hook is not None:
+            out.probe_s_before = _probe_hook.prefill_s_before
+            out.probe_s_after = _probe_hook.prefill_s_after
+            out.probe_applied = _probe_hook.prefill_applied
+            out.probe_alpha = _probe_hook.prefill_alpha
+            out.probe_risk = _probe_hook.prefill_risk
+            out.probe_orth_abs = _probe_hook.prefill_orth_abs
+            if _probe_hook.prefill_s_before is not None and _probe_hook.prefill_s_after is not None:
+                out.probe_delta_s = _probe_hook.prefill_s_after - _probe_hook.prefill_s_before
+            else:
+                out.probe_delta_s = None
+        else:
+            out.probe_s_before = None
+            out.probe_s_after = None
+            out.probe_delta_s = None
+            out.probe_applied = None
+            out.probe_alpha = None
+            out.probe_risk = None
+            out.probe_orth_abs = None
         out.timing = {
             "forward_s": float(forward_time_s),
             "entropy_s": float(entropy_time_s),
@@ -1654,16 +2180,32 @@ def entropy_temp_generate(
             "total_s": float(forward_time_s + entropy_time_s + sampling_time_s),
         }
         out.force_no_intervention = bool(force_no_intervention)
-        # Clean up hook
+        # Clean up hooks
         if _hook_handle is not None:
             _hook_handle.remove()
         if _intervention_hook is not None:
             _intervention_hook.enabled = False
+        if _contrastive_handle is not None:
+            _contrastive_handle.remove()
+        if _contrastive_hook is not None:
+            _contrastive_hook.enabled = False
+        if _probe_handle is not None:
+            _probe_handle.remove()
+        if _probe_hook is not None:
+            _probe_hook.enabled = False
         return out
 
-    # Clean up hook on non-dict path
+    # Clean up hooks on non-dict path
     if _hook_handle is not None:
         _hook_handle.remove()
     if _intervention_hook is not None:
         _intervention_hook.enabled = False
+    if _contrastive_handle is not None:
+        _contrastive_handle.remove()
+    if _contrastive_hook is not None:
+        _contrastive_hook.enabled = False
+    if _probe_handle is not None:
+        _probe_handle.remove()
+    if _probe_hook is not None:
+        _probe_hook.enabled = False
     return input_ids

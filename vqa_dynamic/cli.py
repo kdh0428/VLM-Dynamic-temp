@@ -381,6 +381,101 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Max attraction strength lambda: alpha = lambda * clip((R-tau)/(tau_max-tau), 0, 1).",
     )
+    parser.add_argument(
+        "--risk-gate-mode",
+        type=str,
+        choices=["ratio_only", "abs_only", "ratio_and_abs"],
+        default="ratio_only",
+        help="Gate metric for risk-based gating across all hooks: "
+             "ratio_only uses R(h)=||z_orth||/||z|| > tau (default), "
+             "abs_only uses e(h)=||z_orth|| > tau_abs, "
+             "ratio_and_abs requires BOTH R(h) > tau AND e(h) > tau_abs.",
+    )
+    parser.add_argument(
+        "--subspace-tau-abs",
+        type=float,
+        default=30.0,
+        help="Absolute residual norm threshold e(h)=||z_orth||: "
+             "used when --risk-gate-mode is abs_only or ratio_and_abs.",
+    )
+    # ── Contrastive-axis intervention ──
+    parser.add_argument(
+        "--contrastive-enable",
+        action="store_true",
+        help="Enable contrastive-axis intervention. Supersedes subspace hook "
+             "when both are enabled (subspace hook is deregistered). "
+             "Risk gate requires --subspace-shrink-enable with "
+             "--subspace-basis-layer matching --contrastive-layer AND "
+             "same calibration source (meta.json hidden_jsonl must match); "
+             "otherwise runs UNGATED.",
+    )
+    parser.add_argument(
+        "--contrastive-dir",
+        type=str,
+        default="",
+        help="Directory containing contrastive_m.pt and contrastive_v_hat.pt.",
+    )
+    parser.add_argument(
+        "--contrastive-layer",
+        type=int,
+        default=19,
+        help="Layer index where contrastive hook is applied.",
+    )
+    parser.add_argument(
+        "--contrastive-tau-s",
+        type=float,
+        default=0.0,
+        help="Threshold on contrastive projection s: intervene when s < tau_s.",
+    )
+    parser.add_argument(
+        "--contrastive-lambda",
+        type=float,
+        default=0.5,
+        help="Intervention strength: s' = s + lambda * (tau_s - s).",
+    )
+    # ── Probe intervention ──
+    parser.add_argument(
+        "--probe-enable",
+        action="store_true",
+        help="Enable logistic-probe-based intervention. Supersedes contrastive "
+             "and subspace hooks. Requires --probe-dir with meta.json whose "
+             "layer matches --probe-layer (error otherwise). "
+             "Risk gate requires --subspace-shrink-enable with matching basis "
+             "layer AND same calibration source (error on mismatch); "
+             "without basis, runs ungated with a warning.",
+    )
+    parser.add_argument(
+        "--probe-dir",
+        type=str,
+        default="",
+        help="Directory containing weight.pt and bias.pt from logistic_probe_fit.py.",
+    )
+    parser.add_argument(
+        "--probe-layer",
+        type=int,
+        default=19,
+        help="Layer index where probe hook is applied.",
+    )
+    parser.add_argument(
+        "--probe-tau-s",
+        type=float,
+        default=0.0,
+        help="Margin threshold: intervene when probe margin s < tau_s.",
+    )
+    parser.add_argument(
+        "--probe-tau-min",
+        type=float,
+        default=-5.0,
+        help="Lower margin for alpha scheduling. Must be strictly less than "
+             "--probe-tau-s (error otherwise). "
+             "alpha = lambda * clip((tau_s - s) / (tau_s - tau_min), 0, 1).",
+    )
+    parser.add_argument(
+        "--probe-lambda",
+        type=float,
+        default=1.0,
+        help="Max intervention magnitude: h' = h + alpha * w_hat.",
+    )
     parser.add_argument("--soft2x2-ht0", type=float, default=1.0)
     parser.add_argument("--soft2x2-ha0", type=float, default=3.0)
     parser.add_argument("--soft2x2-k-t", type=float, default=6.0)
